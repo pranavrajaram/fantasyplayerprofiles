@@ -1,0 +1,424 @@
+---
+title: "2020 Fantasy Football Profile App"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    navbar:
+     - { icon: "fa-twitter", href: "https://twitter.com/_pranavrajaram", align: right}
+     - { icon: "fa-github", href: "https://github.com/pranavrajaram", align: right}
+    theme:
+      bg: "#E5E5E5"
+      fg: "#101010" 
+      primary: "#123456"
+      navbar-bg: "#3ADAC6"
+      version: 4
+      base_font:
+        google: Prompt
+      heading_font:
+        google: Sen
+
+vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# Install necessary packages
+library(flexdashboard)
+library(fantasypros)
+library(nflfastR)
+library(gt)
+library(ggthemes)
+library(ggimage)
+library(ffscrapr)
+library(tidyverse)
+library(scales)
+library(plotly)
+library(bslib)
+library(gsisdecoder)
+
+# Read in data
+weeklydata <- read_csv(("weeklydata.csv")) %>%
+  mutate(player_name = dp_cleannames(player))
+
+# Add boom or bust data
+boomdata <- weeklydata %>%
+  mutate(
+    bust = case_when(
+      position == "QB" & points <= 10 ~ 1,
+      position == "WR" & points <= 8 ~ 1,
+      position == "RB" & points <= 8 ~ 1,
+      position == "TE" & points <= 6 ~ 1,
+      ),
+    boom = case_when(
+      position == "QB" & points >= 25 ~ 1,
+      position == "WR" & points >= 20 ~ 1,
+      position == "RB" & points >= 20 ~ 1,
+      position == "TE" & points >= 15 ~ 1)) %>% 
+  group_by(player_name) %>%
+  filter(!is.na(boom)) %>% 
+  summarise(boomweeks = sum(boom))
+
+bustdata <- weeklydata %>%
+  mutate(
+    bust = case_when(
+      position == "QB" & points <= 10 ~ 1,
+      position == "WR" & points <= 8 ~ 1,
+      position == "RB" & points <= 8 ~ 1,
+      position == "TE" & points <= 6 ~ 1,
+    ),
+    boom = case_when(
+      position == "QB" & points >= 25 ~ 1,
+      position == "WR" & points >= 20 ~ 1,
+      position == "RB" & points >= 20 ~ 1,
+      position == "TE" & points >= 15 ~ 1)) %>% 
+  group_by(player_name) %>%
+  filter(!is.na(bust)) %>% 
+  summarise(bustweeks = sum(bust))
+
+# Finish stats
+finalstats <- fp_fantasy_points(season = 2020) %>%
+  group_by(position) %>%
+  mutate(pos_rank = dense_rank(desc(points))) %>%
+  filter(position != "DST") %>%
+  filter(position != "K") %>%
+  filter(pos_rank <= 36) %>%
+  ungroup() %>%
+  mutate(player_name = dp_cleannames(player)) %>%
+  select(player_name, position, points, games, avg, pos_rank)
+
+roster <- nflfastR::fast_scraper_roster(2020) %>% 
+  mutate(player_name = dp_cleannames(full_name)) %>%
+  select(player_name, position, gsis_id, height, weight, college, headshot_url)
+
+finalstats <- finalstats %>%
+  left_join(roster, by = c("player_name" = "player_name")) %>%
+  filter(weight != 315) %>%
+  filter(weight != 262) %>%
+  filter(college != "Nebraska")
+
+finalstats <- finalstats %>%
+  left_join(boomdata, by = c("player_name" = "player_name")) %>% 
+  left_join(bustdata, by = c("player_name" = "player_name")) 
+
+finalstats$bustweeks[is.na(finalstats$bustweeks)] <- 0
+finalstats$boomweeks[is.na(finalstats$boomweeks)] <- 0
+
+finalstats <- finalstats %>%
+  mutate(boompct = round(boomweeks/games*100, 3),
+         bustpct = round(bustweeks/games*100, 3))
+
+playerstats <- finalstats %>%
+  select(-height, -weight, -college) %>%
+  rename(position = "position.x")
+
+boombust <- finalstats %>%
+  select(player_name, boomweeks, bustweeks, boompct, bustpct)
+
+pbp <- load_pbp(2020)
+
+# Red Zone Data
+redzonepbp <- pbp %>% 
+  filter(pass == 1 | rush == 1) %>%
+  filter(play_type != "no_play") %>%
+  filter(yardline_100 <= 20)
+
+redzone <- calculate_player_stats(redzonepbp) %>%
+  left_join(roster, by = c("player_id" = "gsis_id")) %>% 
+  select(player_name.y, position, completions, attempts, passing_yards, passing_tds, carries, rushing_yards, rushing_tds, receptions, targets, receiving_yards, receiving_tds) %>%
+  rename(player_name = "player_name.y")
+
+redzone_consolidated <- redzone %>%
+  mutate(total_yards = passing_yards + rushing_yards + receiving_yards) %>%
+  mutate(total_opportunities = attempts + carries + targets) %>%
+  mutate(total_tds = passing_tds + rushing_tds + receiving_tds) %>%
+  select(player_name, position, total_yards, total_opportunities, total_tds)
+
+```
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+
+```{r}
+tags$style(type='text/css', ".selectize-input { line-height: 32px;} .selectize-dropdown {  line-height: 28px; }")
+selectInput("player", label = "Choose a Player: ",
+            choices = playerstats$player_name)
+```
+<center> Select a player, and see a complete breakdown of their 2020 Fantasy Season. <center>
+<br>
+Made by @_pranavrajaram
+
+Row {data-height=250}
+-----------------------------------------------------------------------
+
+### Season Overview
+
+```{r}
+selectedData <- reactive({
+  playerstats %>%
+    select(player_name, headshot_url, position, points, avg, games, pos_rank) %>%
+    filter(player_name == input$player) %>%
+    gt() %>%
+    cols_align(align = "center",
+             columns = c(player_name, pos_rank, points, avg, position, games)) %>%
+    tab_options(
+      data_row.padding = px(1)) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_column_labels(everything())) %>%
+    tab_header(
+      title = md("Player Summary"),
+    ) %>%
+    cols_label(
+      player_name = "Name",
+      headshot_url = "",
+      position = "Pos",
+      games = "Games",
+      points = "Fantasy Points",
+      avg = "AVG Fantasy Points",
+      pos_rank = "Position Rank") %>%
+    opt_all_caps() %>%
+    tab_options(
+      table.background.color = "white",
+      column_labels.background.color = "#C60C30") %>%
+    opt_row_striping() %>%
+    opt_table_font(
+      font = list(
+        google_font("Exo 2"),
+        default_fonts()
+      )) %>%
+    text_transform(
+      locations = cells_body(columns = c(headshot_url)),
+      fn = function(x){
+        gt::web_image(x)
+      }
+    ) %>%
+    tab_source_note(md("<center> Data is based off a Half PPR Scoring Format <center>"))
+  })
+
+render_gt(expr = selectedData(), height = "100%", width = "100%")
+
+```
+
+Row {data-height=500}
+-----------------------------------------------------------------------
+
+### Week by Week Performance
+
+```{r}
+selectedData2 <- reactive({
+  weeklydata %>%
+    filter(player_name == input$player) %>%
+    rename(week = "start_week")
+})
+
+
+renderPlotly({
+  g <- ggplot(data = selectedData2(),
+         aes(x = week,
+             y = points)) +
+  geom_point() +
+  geom_smooth(se = FALSE) +
+  geom_hline(aes(yintercept = mean(points)),
+             color = "red",
+             linetype = "dashed") +
+  scale_x_continuous(breaks = pretty_breaks(n = 17),
+                     limits = c(1,17)) +
+  scale_y_continuous(breaks = pretty_breaks(n = 5),
+                     limits = c(-5, 55)) +
+  theme_fivethirtyeight() +
+  labs(title = "Fantasy Points per Week",
+       subtitle = "2020 NFL Season",
+       x = "Week",
+       y = "Fantasy Points") +
+  theme(axis.title = element_text())
+  
+  ggplotly(g, hoverinfo = selectedData2()) 
+})
+  
+```
+
+Column {data-height=300}
+-------------------------------------
+
+### Consistency Breakdown
+
+```{r}
+selectedData3 <- reactive({
+  boombust %>%
+  filter(player_name == input$player) %>%
+  select(-player_name) %>%
+  gt() %>%
+  cols_align(align = "center",
+             columns = c(boomweeks, bustweeks, boompct, bustpct)) %>%
+  tab_options(
+    data_row.padding = px(1)) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())) %>%
+  tab_header(
+    title = md("Consistency Breakdown"),
+  ) %>%
+  cols_label(
+    boomweeks = "Boom Weeks",
+    bustweeks = "Bust Weeks",
+    boompct = "Pct of games Boom",
+    bustpct = "Pct of games Bust") %>%
+  opt_all_caps() %>%
+  tab_options(
+    table.background.color = "white",
+    column_labels.background.color = "darkslateblue") %>%
+  opt_row_striping() %>%
+  opt_table_font(
+    font = list(
+      google_font("Exo 2"),
+      default_fonts()
+    )) %>%
+  data_color(
+    columns = c(boomweeks),
+    colors = scales::col_numeric(
+      palette = case_when(
+        boomweeks >= 4 ~ c("forestgreen"),
+        boomweeks < 4 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  ) %>%
+  data_color(
+    columns = c(bustweeks),
+    colors = scales::col_numeric(
+      palette = case_when(
+        bustweeks >= 5 ~ c("firebrick1"),
+        bustweeks < 5 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  ) %>%
+  data_color(
+    columns = c(boompct),
+    colors = scales::col_numeric(
+      palette = case_when(
+        boompct >= 25 ~ c("forestgreen"),
+        boompct < 25 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  ) %>%
+  data_color(
+    columns = c(bustpct),
+    colors = scales::col_numeric(
+      palette = case_when(
+        bustpct >= 20 ~ c("firebrick1"),
+        bustweeks < 30 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  )
+})
+
+render_gt(expr = selectedData3(), height = "100%", width = "100%")
+
+```
+
+### Red Zone Review
+```{r}
+selectedData4 <- reactive({
+  redzone_consolidated %>%
+  filter(player_name == input$player) %>%
+  select(-player_name) %>%
+  select(position, total_opportunities, total_tds, total_yards) %>%
+  gt() %>%
+  cols_align(align = "center",
+             columns = c(total_yards, total_opportunities, total_tds)) %>%
+  tab_options(
+    data_row.padding = px(1)) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())) %>%
+  tab_header(
+    title = md("Red Zone Review"),
+  ) %>%
+  cols_label(
+    position = "Pos",
+    total_opportunities = "Red Zone Opportunities",
+    total_tds = "Red Zone TDs",
+    total_yards = "Red Zone Yards") %>%
+  opt_all_caps() %>%
+  tab_options(
+    table.background.color = "white",
+    column_labels.background.color = "darkslateblue") %>%
+  opt_row_striping() %>%
+  opt_table_font(
+    font = list(
+      google_font("Exo 2"),
+      default_fonts()
+    )) %>%
+  data_color(
+    columns = c(total_yards),
+    colors = scales::col_numeric(
+      palette = case_when(
+        position == "RB" & total_yards >= 110 ~ c("forestgreen"),
+        position == "RB" & total_yards < 110 & total_yards >= 80 ~ c("darkgoldenrod1"),
+        position == "RB" & total_yards < 80 ~ c("gray"),
+        position == "QB" & total_yards >= 330 ~ c("forestgreen"),
+        position == "QB" & total_yards < 330 & total_yards >= 200 ~ c("darkgoldenrod1"),
+        position == "QB" & total_yards < 200 ~ c("gray"),
+        position == "WR" & total_yards >= 93 ~ c("forestgreen"),
+        position == "WR" & total_yards < 93 & total_yards >= 65 ~ c("darkgoldenrod1"),
+        position == "WR" & total_yards < 65 ~ c("gray"),
+        position == "TE" & total_yards >= 80 ~ c("forestgreen"),
+        position == "TE" & total_yards < 80 & total_yards >= 50 ~ c("darkgoldenrod1"),
+        position == "TE" & total_yards < 50 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  ) %>%
+  data_color(
+    columns = c(total_opportunities),
+    colors = scales::col_numeric(
+      palette = case_when(
+        position == "RB" & total_opportunities >= 50 ~ c("forestgreen"),
+        position == "RB" & total_opportunities < 50 & total_opportunities >= 30 ~ c("darkgoldenrod1"),
+        position == "RB" & total_opportunities < 30 ~ c("gray"),
+        position == "QB" & total_opportunities >= 95 ~ c("forestgreen"),
+        position == "QB" & total_opportunities < 95 & total_opportunities >= 70 ~ c("darkgoldenrod1"),
+        position == "QB" & total_opportunities < 70 ~ c("gray"),
+        position == "WR" & total_opportunities >= 20 ~ c("forestgreen"),
+        position == "WR" & total_opportunities < 20 & total_opportunities >= 15 ~ c("darkgoldenrod1"),
+        position == "WR" & total_opportunities < 15 ~ c("gray"),
+        position == "TE" & total_opportunities >= 19 ~ c("forestgreen"),
+        position == "TE" & total_opportunities < 19 & total_opportunities >= 13 ~ c("darkgoldenrod1"),
+        position == "TE" & total_opportunities < 13 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  ) %>%
+  data_color(
+    columns = c(total_tds),
+    colors = scales::col_numeric(
+      palette = case_when(
+        position == "RB" & total_tds >= 10 ~ c("forestgreen"),
+        position == "RB" & total_tds < 10 & total_tds >= 7 ~ c("darkgoldenrod1"),
+        position == "RB" & total_tds < 7 ~ c("gray"),
+        position == "QB" & total_tds >= 30 ~ c("forestgreen"),
+        position == "QB" & total_tds < 30 & total_tds >= 20 ~ c("darkgoldenrod1"),
+        position == "QB" & total_tds < 20 ~ c("gray"),
+        position == "WR" & total_tds >= 8 ~ c("forestgreen"),
+        position == "WR" & total_tds < 8 & total_tds >= 4 ~ c("darkgoldenrod1"),
+        position == "WR" & total_tds < 4 ~ c("gray"),
+        position == "TE" & total_tds >= 7 ~ c("forestgreen"),
+        position == "TE" & total_tds < 7 & total_tds >= 4 ~ c("darkgoldenrod1"),
+        position == "TE" & total_tds < 4 ~ c("gray")
+      ),
+      domain = NULL
+    )
+  ) %>%
+  tab_source_note(md("<center> Note: Total Opportunities is pass attempts for QBs, targets + carries for RB/WR/TE </center>"))
+})
+
+render_gt(selectedData4(), height = "100%", width = "100%")
+```
+
+
+
+
